@@ -1,55 +1,85 @@
 import express from "express";
 import cors from "cors";
+import Database from "better-sqlite3";
 
 const app = express();
-app.use(cors());
+
+// مهم فـ Render/Proxies باش req.ip يجيب IP الحقيقي
+app.set("trust proxy", 1);
+
 app.use(express.json());
 
-const BLOCK_HOURS = 24;
+// بدّل هاد الدومين لدومين الستور ديالك باش CORS يكون مضبوط
+app.use(
+  cors({
+    origin: true, // إلى بغيتي تشددها: ["https://YOUR-DOMAIN.com"]
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type"],
+  })
+);
 
-// تخزين مؤقت فالرام (نسخة بسيطة)
-const blockedVisitors = new Map();
+const db = new Database("db.sqlite");
+db.pragma("journal_mode = WAL");
 
-// health check
-app.get("/", (req, res) => {
-  res.send("Anti-fake server running ✅");
-});
+db.exec(`
+  CREATE TABLE IF NOT EXISTS ip_blocks (
+    ip TEXT PRIMARY KEY,
+    expires_at INTEGER NOT NULL,
+    last_seen INTEGER NOT NULL
+  );
+`);
 
-// check visitor
-app.post("/check", (req, res) => {
-  const { visitorId } = req.body;
+function getClientIp(req) {
+  // Express مع trust proxy كيعطيك req.ip مزيان
+  let ip = req.ip || "";
+  // نحيّد prefix ديال IPv6 mapping
+  if (ip.startsWith("::ffff:")) ip = ip.replace("::ffff:", "");
+  return ip;
+}
 
-  if (!visitorId) {
-    return res.status(400).json({ error: "visitorId required" });
+function cleanupExpired() {
+  const now = Date.now();
+  db.prepare("DELETE FROM ip_blocks WHERE expires_at <= ?").run(now);
+}
+
+// Check IP
+app.post("/check-ip", (req, res) => {
+  cleanupExpired();
+  const ip = getClientIp(req);
+
+  if (!ip) return res.json({ blocked: false, reason: "no_ip" });
+
+  const row = db.prepare("SELECT expires_at FROM ip_blocks WHERE ip = ?").get(ip);
+
+  if (row && row.expires_at > Date.now()) {
+    const remainingMs = row.expires_at - Date.now();
+    return res.json({ blocked: true, remainingSeconds: Math.ceil(remainingMs / 1000) });
   }
 
-  const record = blockedVisitors.get(visitorId);
-
-  if (record && Date.now() < record) {
-    return res.json({
-      blocked: true,
-      remainingMs: record - Date.now()
-    });
-  }
-
-  res.json({ blocked: false });
+  return res.json({ blocked: false });
 });
 
-// mark order completed
-app.post("/complete", (req, res) => {
-  const { visitorId } = req.body;
+// Mark IP for 24h
+app.post("/mark-ip", (req, res) => {
+  cleanupExpired();
+  const ip = getClientIp(req);
+  if (!ip) return res.json({ ok: false, reason: "no_ip" });
 
-  if (!visitorId) {
-    return res.status(400).json({ error: "visitorId required" });
-  }
+  const now = Date.now();
+  const expiresAt = now + 24 * 60 * 60 * 1000;
 
-  const blockUntil = Date.now() + BLOCK_HOURS * 60 * 60 * 1000;
-  blockedVisitors.set(visitorId, blockUntil);
+  db.prepare(`
+    INSERT INTO ip_blocks (ip, expires_at, last_seen)
+    VALUES (?, ?, ?)
+    ON CONFLICT(ip) DO UPDATE SET
+      expires_at = excluded.expires_at,
+      last_seen = excluded.last_seen
+  `).run(ip, expiresAt, now);
 
-  res.json({ success: true, blockUntil });
+  res.json({ ok: true, ip, expiresAt });
 });
+
+app.get("/", (req, res) => res.send("Anti-fake server running ✅"));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log("Server running on port", PORT);
-});
+app.listen(PORT, () => console.log("Listening on", PORT));
