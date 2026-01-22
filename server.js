@@ -1,20 +1,17 @@
 import express from "express";
 import cors from "cors";
 import Database from "better-sqlite3";
+import crypto from "crypto";
 
 const app = express();
-
-// مهم فـ Render/Proxies باش req.ip يجيب IP الحقيقي
 app.set("trust proxy", 1);
 
 app.use(express.json());
 
-// بدّل هاد الدومين لدومين الستور ديالك باش CORS يكون مضبوط
 app.use(
   cors({
-    origin: true, // إلى بغيتي تشددها: ["https://YOUR-DOMAIN.com"]
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type"],
+    origin: true,
+    credentials: true, // مهم للكوكيز
   })
 );
 
@@ -22,64 +19,94 @@ const db = new Database("db.sqlite");
 db.pragma("journal_mode = WAL");
 
 db.exec(`
-  CREATE TABLE IF NOT EXISTS ip_blocks (
-    ip TEXT PRIMARY KEY,
+  CREATE TABLE IF NOT EXISTS blocks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ip TEXT,
+    cookie_id TEXT,
     expires_at INTEGER NOT NULL,
-    last_seen INTEGER NOT NULL
+    created_at INTEGER NOT NULL
   );
 `);
 
+function cleanupExpired() {
+  db.prepare(`DELETE FROM blocks WHERE expires_at <= ?`).run(Date.now());
+}
+
 function getClientIp(req) {
-  // Express مع trust proxy كيعطيك req.ip مزيان
   let ip = req.ip || "";
-  // نحيّد prefix ديال IPv6 mapping
   if (ip.startsWith("::ffff:")) ip = ip.replace("::ffff:", "");
   return ip;
 }
 
-function cleanupExpired() {
-  const now = Date.now();
-  db.prepare("DELETE FROM ip_blocks WHERE expires_at <= ?").run(now);
+function parseCookies(req) {
+  const header = req.headers.cookie;
+  if (!header) return {};
+  return Object.fromEntries(
+    header.split(";").map(c => {
+      const [k, ...v] = c.trim().split("=");
+      return [k, decodeURIComponent(v.join("="))];
+    })
+  );
 }
 
-// Check IP
-app.post("/check-ip", (req, res) => {
+function generateId() {
+  return crypto.randomBytes(16).toString("hex");
+}
+
+/* ================= CHECK ================= */
+app.post("/check", (req, res) => {
   cleanupExpired();
+
   const ip = getClientIp(req);
+  const cookies = parseCookies(req);
+  const cookieId = cookies.af_id;
 
-  if (!ip) return res.json({ blocked: false, reason: "no_ip" });
+  const now = Date.now();
 
-  const row = db.prepare("SELECT expires_at FROM ip_blocks WHERE ip = ?").get(ip);
+  const row = db.prepare(`
+    SELECT * FROM blocks
+    WHERE (ip = ? OR cookie_id = ?)
+      AND expires_at > ?
+    LIMIT 1
+  `).get(ip, cookieId || "", now);
 
-  if (row && row.expires_at > Date.now()) {
-    const remainingMs = row.expires_at - Date.now();
-    return res.json({ blocked: true, remainingSeconds: Math.ceil(remainingMs / 1000) });
+  if (row) {
+    return res.json({
+      blocked: true,
+      remainingSeconds: Math.ceil((row.expires_at - now) / 1000),
+    });
   }
 
   return res.json({ blocked: false });
 });
 
-// Mark IP for 24h
-app.post("/mark-ip", (req, res) => {
+/* ================= MARK ================= */
+app.post("/mark", (req, res) => {
   cleanupExpired();
+
   const ip = getClientIp(req);
-  if (!ip) return res.json({ ok: false, reason: "no_ip" });
+  const cookies = parseCookies(req);
+
+  let cookieId = cookies.af_id;
+  if (!cookieId) cookieId = generateId();
 
   const now = Date.now();
   const expiresAt = now + 24 * 60 * 60 * 1000;
 
   db.prepare(`
-    INSERT INTO ip_blocks (ip, expires_at, last_seen)
-    VALUES (?, ?, ?)
-    ON CONFLICT(ip) DO UPDATE SET
-      expires_at = excluded.expires_at,
-      last_seen = excluded.last_seen
-  `).run(ip, expiresAt, now);
+    INSERT INTO blocks (ip, cookie_id, expires_at, created_at)
+    VALUES (?, ?, ?, ?)
+  `).run(ip, cookieId, expiresAt, now);
 
-  res.json({ ok: true, ip, expiresAt });
+  res.setHeader(
+    "Set-Cookie",
+    `af_id=${cookieId}; Max-Age=86400; Path=/; SameSite=Lax`
+  );
+
+  res.json({ ok: true });
 });
 
-app.get("/", (req, res) => res.send("Anti-fake server running ✅"));
+app.get("/", (_, res) => res.send("Anti-fake server running ✅"));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("Listening on", PORT));
+app.listen(PORT, () => console.log("Server running on", PORT));
